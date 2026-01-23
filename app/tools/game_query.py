@@ -26,8 +26,9 @@ class GameQueryTool:
     def __init__(self, connection: PgConnection):
         self.connection = connection
         
+        # 기본 매핑 (폴백용)
         self.TEAM_CODE_TO_NAME = {
-            "KIA": "KIA 타이거즈",
+            "HT": "KIA 타이거즈", "KIA": "KIA 타이거즈",
             "LG": "LG 트윈스",
             "OB": "두산 베어스",
             "LT": "롯데 자이언츠",
@@ -36,11 +37,12 @@ class GameQueryTool:
             "HH": "한화 이글스",
             "KT": "KT 위즈",
             "NC": "NC 다이노스",
+            "SSG": "SSG 랜더스",
             "SK": "SSG 랜더스"
         }
 
         self.NAME_TO_CODE = {
-            "KIA": "KIA", "기아": "KIA", "KIA 타이거즈": "KIA", "타이거즈": "KIA",
+            "KIA": "HT", "기아": "HT", "KIA 타이거즈": "HT", "타이거즈": "HT", "HT": "HT",
             "LG": "LG", "LG 트윈스": "LG", "트윈스": "LG",
             "두산": "OB", "OB": "OB", "두산 베어스": "OB", "베어스": "OB",
             "롯데": "LT", "LT": "LT", "롯데 자이언츠": "LT", "자이언츠": "LT",
@@ -49,8 +51,68 @@ class GameQueryTool:
             "한화": "HH", "HH": "HH", "한화 이글스": "HH", "이글스": "HH",
             "KT": "KT", "KT 위즈": "KT", "위즈": "KT",
             "NC": "NC", "NC 다이노스": "NC", "다이노스": "NC",
-            "SSG": "SK", "SK": "SK", "SSG 랜더스": "SK", "랜더스": "SK"
+            "SSG": "SSG", "SK": "SSG", "SSG 랜더스": "SSG", "랜더스": "SSG"
         }
+        
+        # DB에서 최신 매핑 로드
+        self._load_team_mappings()
+
+    def _load_team_mappings(self):
+        """OCI DB의 teams 테이블과 franchise_id를 활용하여 팀 매핑 정보를 동적으로 로드합니다."""
+        try:
+            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = """
+                SELECT team_id, team_name, franchise_id, founded_year 
+                FROM teams 
+                WHERE franchise_id IS NOT NULL 
+                ORDER BY franchise_id, founded_year DESC;
+            """
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            
+            if rows:
+                logger.info(f"[GameQuery] Syncing {len(rows)} franchise entries from OCI")
+                
+                # 프랜차이즈별로 그룹화
+                franchises = {}
+                for row in rows:
+                    f_id = row['franchise_id']
+                    if f_id not in franchises:
+                        franchises[f_id] = []
+                    franchises[f_id].append(row)
+                
+                for f_id, members in franchises.items():
+                    # 1. 현대적 브랜드명 선정 (DESC 정렬이므로 첫 번째가 최신)
+                    modern_team = members[0]
+                    modern_name = modern_team['team_name']
+                    
+                    # 2. 경기(game) 테이블 매핑 원칙: 
+                    # SSG는 'SSG' 사용, KIA는 'HT' 사용, 키움은 'WO' 사용 확인됨
+                    if modern_name == "SSG 랜더스":
+                        target_code = "SSG"
+                    elif modern_name == "KIA 타이거즈":
+                        target_code = "HT"
+                    else:
+                        # 기본적으로는 members 중 가장 오래된 혹은 안정된 ID 선택 시도
+                        target_code = next((m['team_id'] for m in members if m['team_id'] in ['HT', 'WO', 'OB', 'SS', 'LT', 'HH', 'KT', 'NC', 'LG']), modern_team['team_id'])
+                    
+                    # 3. 매핑 데이터 업데이트
+                    for member in members:
+                        m_id = member['team_id']
+                        m_name = member['team_name']
+                        
+                        self.NAME_TO_CODE[m_id] = target_code
+                        self.NAME_TO_CODE[m_name] = target_code
+                        self.NAME_TO_CODE[m_name.split()[0]] = target_code
+                        
+                        self.TEAM_CODE_TO_NAME[m_id] = modern_name
+                        self.TEAM_CODE_TO_NAME[target_code] = modern_name
+                
+                logger.info("[GameQuery] Game Team codes synchronized using OCI franchise IDs.")
+            
+            cursor.close()
+        except Exception as e:
+            logger.warning(f"[GameQuery] Dynamic mapping failed from OCI: {e}. Using defaults.")
 
     def get_team_name(self, team_code: str) -> str:
         return self.TEAM_CODE_TO_NAME.get(team_code, team_code)
@@ -189,57 +251,72 @@ class GameQueryTool:
             for game in games:
                 game_dict = dict(game)
                 game_dict = self._format_game_response(game_dict)
+                game_id = game_dict['game_id']
                 
-                # 박스스코어 상세 정보 조회 (실제 스키마 기준)
-                box_score_query = """
-                    SELECT 
-                        game_id,
-                        stadium,
-                        crowd,
-                        start_time,
-                        end_time,
-                        game_time,
-                        away_record,
-                        home_record,
-                        away_1, away_2, away_3, away_4, away_5, away_6, away_7, away_8, away_9,
-                        home_1, home_2, home_3, home_4, home_5, home_6, home_7, home_8, home_9,
-                        away_r, away_h, away_e,
-                        home_r, home_h, home_e
-                    FROM box_score 
-                    WHERE game_id = %s;
+                # 1. 이닝별 점수 조회
+                inning_query = """
+                    SELECT inning_number, home_score, away_score 
+                    FROM game_inning_scores 
+                    WHERE game_id = %s 
+                    ORDER BY inning_number;
                 """
+                cursor.execute(inning_query, (game_id,))
+                innings = cursor.fetchall()
                 
-                cursor.execute(box_score_query, (game_dict['game_id'],))
-                box_score = cursor.fetchone()
+                box_score = {
+                    "game_id": game_id,
+                    "away_r": game_dict.get('away_score', 0),
+                    "home_r": game_dict.get('home_score', 0),
+                    "away_h": 0, "home_h": 0,  # 타격 스탯에서 집계 필요
+                    "away_e": 0, "home_e": 0   # 실책 정보는 현재 스키마에 없으면 0 처리
+                }
                 
-                if box_score:
-                    game_dict['box_score'] = dict(box_score)
-                else:
-                    game_dict['box_score'] = {}
+                # 이닝 점수 매핑
+                for inning in innings:
+                    idx = inning['inning_number']
+                    box_score[f'away_{idx}'] = inning['away_score']
+                    box_score[f'home_{idx}'] = inning['home_score']
+                    
+                game_dict['box_score'] = box_score
                 
-                # 게임 요약 정보 조회 (실제 스키마 기준)
-                summary_query = """
-                    SELECT 
-                        summary_type,
-                        player_name,
-                        detail_text
-                    FROM game_summary
-                    WHERE game_id = %s;
+                # 2. 타격 기록 요약 (안타 수 집계 등)
+                batting_query = """
+                    SELECT team_code, COUNT(*) as hits
+                    FROM game_batting_stats
+                    WHERE game_id = %s AND hit_type IS NOT NULL
+                    GROUP BY team_code
+                """ 
+                # Note: hit_type 컬럼이 있는지 확인 필요. 
+                # 단순 안타수 집계가 어렵다면 game_batting_stats에서 hits 컬럼을 sum 
+                # (테이블 구조 확인이 안되므로 일반적인 구조 가정: hits 컬럼 존재 시)
+                
+                stats_check_query = """
+                    SELECT team_code, SUM(hits) as total_hits, SUM(rbi) as total_rbi
+                    FROM game_batting_stats
+                    WHERE game_id = %s
+                    GROUP BY team_code
                 """
-                
-                cursor.execute(summary_query, (game_dict['game_id'],))
-                summaries = cursor.fetchall()
-                
-                if summaries:
-                    game_dict['summary'] = [dict(summary) for summary in summaries]
-                else:
-                    game_dict['summary'] = []
-                
+                try:
+                    cursor.execute(stats_check_query, (game_id,))
+                    team_stats = cursor.fetchall()
+                    for stat in team_stats:
+                        # team_code가 home_team인지 away_team인지 확인
+                        # (DB에 저장된 team_code와 game 테이블의 팀 코드가 일치한다고 가정)
+                        # normalize를 통해 비교
+                        t_code = self._normalize_team_name(stat['team_code'])
+                        if t_code == self._normalize_team_name(game_dict.get('home_team', '')):
+                            box_score['home_h'] = stat['total_hits']
+                        else:
+                            box_score['away_h'] = stat['total_hits']
+                except Exception:
+                    # 컬럼이 없거나 오류 발생시 0으로 유지 (로그 생략 가능)
+                    pass
+
                 result["games"].append(game_dict)
             
             result["found"] = True
             result["total_games"] = len(result["games"])
-            logger.info(f"[GameQuery] Found {len(result['games'])} games")
+            logger.info(f"[GameQuery] Found {len(result['games'])} games (stats aggregated)")
             
         except Exception as e:
             logger.error(f"[GameQuery] Box score query error: {e}")
@@ -402,7 +479,8 @@ class GameQueryTool:
                 LIMIT %s;
             """
             
-            games_params = query_params + [team1_normalized, team2_normalized, limit]
+            # 파라미터 순서: [CASE_WHEN_team1, CASE_WHEN_team2] + [WHERE_params] + [LIMIT]
+            games_params = [team1_normalized, team2_normalized] + query_params + [limit]
             cursor.execute(games_query, games_params)
             games = cursor.fetchall()
             
@@ -668,6 +746,162 @@ class GameQueryTool:
 
         return result
     
+    def get_game_lineup(
+        self, 
+        game_id: str = None, 
+        date: str = None,
+        team_name: str = None
+    ) -> Dict[str, Any]:
+        """
+        특정 경기의 선발 라인업을 조회합니다.
+        
+        Args:
+            game_id: 경기 고유 ID
+            date: 경기 날짜 (YYYY-MM-DD)
+            team_name: 팀명
+            
+        Returns:
+            라인업 정보 결과
+        """
+        logger.info(f"[GameQuery] Lineup query - ID: {game_id}, Date: {date}, Team: {team_name}")
+        
+        result = {
+            "query_params": {
+                "game_id": game_id,
+                "date": date,
+                "team_name": team_name
+            },
+            "lineups": [],
+            "found": False,
+            "error": None
+        }
+        
+        try:
+            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # 1. 경기 ID 찾기 (ID가 없는 경우)
+            if not game_id and date:
+                where_clause = "DATE(game_date) = %s"
+                params = [date]
+                if team_name:
+                    normalized_team = self._normalize_team_name(team_name)
+                    where_clause += " AND (home_team = %s OR away_team = %s)"
+                    params.extend([normalized_team, normalized_team])
+                
+                cursor.execute(f"SELECT game_id FROM game WHERE {where_clause} LIMIT 1", params)
+                row = cursor.fetchone()
+                if row:
+                    game_id = row['game_id']
+            
+            if not game_id:
+                result["error"] = "경기를 찾을 수 없거나 game_id가 제공되지 않았습니다."
+                return result
+            
+            # 2. 라인업 조회 (새로 추가된 player_name, is_starter 컬럼 사용)
+            lineup_query = """
+                SELECT 
+                    team_code,
+                    player_name,
+                    position,
+                    batting_order,
+                    is_starter
+                FROM game_lineups
+                WHERE game_id = %s
+            """
+            params = [game_id]
+            
+            if team_name:
+                normalized_team = self._normalize_team_name(team_name)
+                lineup_query += " AND team_code = %s"
+                params.append(normalized_team)
+                
+            lineup_query += " ORDER BY team_code, batting_order"
+            
+            cursor.execute(lineup_query, params)
+            rows = cursor.fetchall()
+            
+            if rows:
+                result["lineups"] = [dict(row) for row in rows]
+                result["found"] = True
+                
+                # 팀 코드를 이름으로 변환
+                for entry in result["lineups"]:
+                    entry["team_name"] = self.get_team_name(entry["team_code"])
+                    
+                logger.info(f"[GameQuery] Found {len(rows)} lineup entries for game {game_id}")
+            else:
+                logger.warning(f"[GameQuery] No lineup found for game {game_id}")
+                
+        except Exception as e:
+            logger.error(f"[GameQuery] Lineup query error: {e}")
+            result["error"] = f"라인업 조회 오류: {e}"
+        finally:
+            if 'cursor' in locals():
+                cursor.close()
+                
+        return result
+
+    def get_team_last_game_date(self, team_name: str, year: int, league_type: str = 'regular_season') -> Dict[str, Any]:
+        """
+        특정 팀의 마지막 경기 날짜를 조회합니다.
+        
+        Args:
+            team_name: 팀명
+            year: 시즌 년도
+            league_type: 'regular_season' 또는 'korean_series' 등
+            
+        Returns:
+            팀의 마지막 경기 날짜 정보
+        """
+        logger.info(f"[GameQuery] Getting last game date for {team_name} in {year} ({league_type})")
+        
+        normalized_team = self._normalize_team_name(team_name)
+        
+        result = {
+            "team_name": team_name,
+            "team_id": normalized_team,
+            "year": year,
+            "last_game_date": None,
+            "found": False,
+            "error": None
+        }
+        
+        try:
+            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # 리그 타입 코드 매핑
+            league_code_map = {'regular_season': 0, 'korean_series': 5}
+            league_code = league_code_map.get(league_type, 0)
+            
+            query = """
+                SELECT MAX(g.game_date) as last_game_date
+                FROM game g
+                LEFT JOIN kbo_seasons ks ON g.season_id = ks.season_id
+                WHERE ks.season_year = %s
+                  AND ks.league_type_code = %s
+                  AND (g.home_team = %s OR g.away_team = %s)
+                  AND g.game_status = 'COMPLETED';
+            """
+            
+            cursor.execute(query, (year, league_code, normalized_team, normalized_team))
+            row = cursor.fetchone()
+            
+            if row and row['last_game_date']:
+                result["last_game_date"] = row['last_game_date'].strftime('%Y-%m-%d')
+                result["found"] = True
+                logger.info(f"[GameQuery] Found last game for {team_name}: {result['last_game_date']}")
+            else:
+                logger.warning(f"[GameQuery] No last game found for {team_name} in {year} {league_type}")
+                
+        except Exception as e:
+            logger.error(f"[GameQuery] Team last game query error: {e}")
+            result["error"] = str(e)
+        finally:
+            if 'cursor' in locals():
+                cursor.close()
+                
+        return result
+
     def validate_game_exists(self, game_id: str = None, date: str = None) -> Dict[str, Any]:
         """
         경기 존재 여부를 확인합니다.

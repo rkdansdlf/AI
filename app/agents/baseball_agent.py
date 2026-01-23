@@ -22,7 +22,7 @@ from .tool_caller import ToolCaller, ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
 
-from ..core.prompts import SYSTEM_PROMPT # SYSTEM_PROMPT 임포트
+from ..core.prompts import SYSTEM_PROMPT, FOLLOWUP_PROMPT, COACH_PROMPT, DEFAULT_ANSWER_PROMPT # SYSTEM_PROMPT 임포트
 from ..core.entity_extractor import extract_entities_from_query # 엔티티 추출 임포트
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -49,17 +49,16 @@ def clean_json_response(response: str) -> str:
     return response.strip()
 
 TEAM_CODE_TO_NAME = {
-    "KIA": "KIA 타이거즈", "기아": "KIA 타이거즈",
+    "KIA": "KIA 타이거즈", "HT": "KIA 타이거즈", "기아": "KIA 타이거즈",
     "LG": "LG 트윈스",
-    "SSG": "SSG 랜더스",
+    "SSG": "SSG 랜더스", "SK": "SSG 랜더스",
     "NC": "NC 다이노스",
-    "두산": "두산 베어스",
+    "OB": "두산 베어스", "두산": "두산 베어스",
     "KT": "KT 위즈",
-    "롯데": "롯데 자이언츠",
-    "삼성": "삼성 라이온즈",
-    "한화": "한화 이글스",
-    "키움": "키움 히어로즈",
-    "키움": "키움 히어로즈",
+    "LT": "롯데 자이언츠", "LOT": "롯데 자이언츠", "롯데": "롯데 자이언츠",
+    "SS": "삼성 라이온즈", "삼성": "삼성 라이온즈",
+    "HH": "한화 이글스", "한화": "한화 이글스",
+    "WO": "키움 히어로즈", "키움": "키움 히어로즈",
 }
 
 def _replace_team_codes(data: Any) -> Any:
@@ -161,12 +160,23 @@ class BaseballStatisticsAgent:
         # 팀 요약 정보 조회 도구
         self.tool_caller.register_tool(
             "get_team_summary",
-            "특정 팀의 주요 선수들과 팀 통계를 실제 DB에서 조회합니다. 팀 관련 질문에 사용하세요.",
+            "특정 팀의 시즌 성적, 경기 기록 요약, 주요 선수 정보를 조회합니다. '삼성 경기 기록 어때?', '롯데 잘해?' 등의 질문에 사용하세요.",
             {
                 "team_name": "팀명 (KIA, LG, 두산 등)",
                 "year": "시즌 년도"
             },
             self._tool_get_team_summary
+        )
+
+        # 팀 심층 지표 조회 도구 (과부하 진단용)
+        self.tool_caller.register_tool(
+            "get_team_advanced_metrics",
+            "팀의 전반적인 성적 순위(ERA 1위 등)와 불펜 과부하 지표(Bullpen Share)를 조회합니다. 팀의 강/약점 분석 및 '과부하' 여부를 판단할 때 반드시 사용하세요.",
+            {
+                "team_name": "팀명 (KIA, LG, 두산 등)",
+                "year": "시즌 년도"
+            },
+            self._tool_get_team_advanced_metrics
         )
         
         # 포지션 정보 조회 도구
@@ -210,6 +220,18 @@ class BaseballStatisticsAgent:
             },
             self._tool_get_velocity_data
         )
+
+        # 고급 통계 조회 도구 (신규)
+        self.tool_caller.register_tool(
+            "get_advanced_stats",
+            "선수의 고급 통계(ERA+, OPS+, FIP, QS 등)를 조회합니다. 전문가 수준의 분석이나 세부 지표 질문에 사용하세요.",
+            {
+                "player_name": "선수명",
+                "year": "시즌 년도",
+                "position": "batting(타자), pitching(투수), 또는 both(둘다, 기본값)"
+            },
+            self._tool_get_advanced_stats
+        )
         
         # KBO 규정 검색 도구
         self.tool_caller.register_tool(
@@ -252,6 +274,29 @@ class BaseballStatisticsAgent:
                 "date": "경기 날짜 (YYYY-MM-DD)"
             },
             self._tool_get_games_by_date
+        )
+
+        # 팀 최근 경기 조회 도구 (신규 추가)
+        self.tool_caller.register_tool(
+            "get_recent_games_by_team",
+            "특정 팀의 최근 경기 기록을 조회합니다. '최근 5경기', '최근 성적', '요즘 경기 결과' 등의 질문에 사용하세요.",
+            {
+                "team_name": "팀명 (예: KT, KIA, LG)",
+                "limit": "조회할 경기 수 (선택적, 기본값 5)"
+            },
+            self._tool_get_recent_games_by_team
+        )
+
+        # 경기 라인업 조회 도구
+        self.tool_caller.register_tool(
+            "get_game_lineup",
+            "특정 경기의 선발 라인업(타순, 포지션, 선수명)을 조회합니다. '누가 나와?', '라인업 알려줘', '선발 누구요?' 등의 질문에 사용하세요.",
+            {
+                "game_id": "경기 고유 ID (선택적)",
+                "date": "경기 날짜 (YYYY-MM-DD, 선택적)",
+                "team_name": "팀명 (선택적)"
+            },
+            self._tool_get_game_lineup
         )
         
         # 팀 간 직접 대결 조회 도구
@@ -369,7 +414,7 @@ class BaseballStatisticsAgent:
         # 문서 검색 도구 (신규 추가)
         self.tool_caller.register_tool(
             "search_documents",
-            "KBO 리그 규정, 용어 정의, 선수 관련 스토리 등 비정형 텍스트 문서를 검색합니다. 'ABS가 뭐야?', 'FA 규정 알려줘'와 같은 설명형/정의형 질문에 사용하세요.",
+            "KBO 리그 규정, 용어 정의, 선수 관련 스토리 등 비정형 텍스트 문서를 검색합니다. 'ABS가 뭐야?', 'FA 규정 알려줘'와 같은 설명형/정의형 질문에 사용하세요. 경기 통계/순위/기록 질문에는 사용하지 마세요.",
             {
                 "query": "검색할 질문 또는 키워드",
                 "limit": "반환할 최대 결과 수 (선택적, 기본값 10)"
@@ -452,63 +497,33 @@ class BaseballStatisticsAgent:
             )
 
     def _load_team_name_mapping(self) -> Dict[str, str]:
-        """팀 ID와 팀명 매핑을 데이터베이스에서 로드합니다."""
+        """팀 ID와 팀명 매핑을 로드합니다."""
         if self._team_name_cache is not None:
             return self._team_name_cache
             
-        try:
-            with self.connection.cursor() as cursor:
-                # 현재 활성화된 팀들의 매핑 정보를 조회 (가장 적절한 팀명 선택)
-                cursor.execute("""
-                    SELECT team_id, full_name 
-                    FROM team_name_mapping 
-                    WHERE full_name IN (
-                        '한화 이글스', 'KIA 타이거즈', 'KT 위즈', 'LG 트윈스', 
-                        '롯데 자이언츠', 'NC 다이노스', '두산 베어스', 'SSG 랜더스', 
-                        '삼성 라이언즈', '키움 히어로즈'
-                    )
-                    ORDER BY team_id, full_name
-                """)
+        # DB 테이블 team_name_mapping이 없으므로 정적 매핑 사용
+        mapping = {
+            'HH': '한화 이글스',
+            'HT': 'KIA 타이거즈', 
+            'KT': 'KT 위즈',
+            'LG': 'LG 트윈스',
+            'LT': '롯데 자이언츠',
+            'NC': 'NC 다이노스',
+            'OB': '두산 베어스',
+            'SK': 'SSG 랜더스',
+            'SS': '삼성 라이언즈',
+            'WO': '키움 히어로즈',
+            '한화': '한화 이글스', 'KIA': 'KIA 타이거즈', '기아': 'KIA 타이거즈',
+            '두산': '두산 베어스', '롯데': '롯데 자이언츠', '삼성': '삼성 라이온즈',
+            '키움': '키움 히어로즈', 'SSG': 'SSG 랜더스', 'NC': 'NC 다이노스',
+            'KT': 'KT 위즈', 'LG': 'LG 트윈스'
+        }
+        
+        self._team_name_cache = mapping
+        return mapping
                 
-                mapping = {}
-                for team_id, full_name in cursor.fetchall():
-                    if team_id not in mapping:  # 각 team_id당 첫 번째 매핑만 사용
-                        mapping[team_id] = full_name
-                
-                # 누락된 team_id에 대한 폴백 매핑
-                fallback_mapping = {
-                    'HH': '한화 이글스',
-                    'HT': 'KIA 타이거즈', 
-                    'KT': 'KT 위즈',
-                    'LG': 'LG 트윈스',
-                    'LT': '롯데 자이언츠',
-                    'NC': 'NC 다이노스',
-                    'OB': '두산 베어스',
-                    'SK': 'SSG 랜더스',
-                    'SS': '삼성 라이언즈',
-                    'WO': '키움 히어로즈'
-                }
-                
-                # 누락된 매핑 보완
-                for team_id, team_name in fallback_mapping.items():
-                    if team_id not in mapping:
-                        mapping[team_id] = team_name
-                
-                self._team_name_cache = mapping
-                logger.info(f"[BaseballAgent] Loaded team mappings: {mapping}")
-                return mapping
-                
-        except Exception as e:
-            logger.error(f"[BaseballAgent] Failed to load team mappings: {e}")
-            # 에러 시 기본 매핑 사용
-            fallback_mapping = {
-                'HH': '한화 이글스', 'HT': 'KIA 타이거즈', 'KT': 'KT 위즈',
-                'LG': 'LG 트윈스', 'LT': '롯데 자이언츠', 'NC': 'NC 다이노스',
-                'OB': '두산 베어스', 'SK': 'SSG 랜더스', 'SS': '삼성 라이언즈',
-                'WO': '키움 히어로즈'
-            }
-            self._team_name_cache = fallback_mapping
-            return fallback_mapping
+        # 이전 DB 조회 코드는 제거됨 (테이블 없음)
+
     
     def _convert_team_id_to_name(self, team_id: str) -> str:
         """팀 ID를 팀명으로 변환합니다."""
@@ -657,6 +672,42 @@ class BaseballStatisticsAgent:
             
         except Exception as e:
             logger.error(f"Final game tool error: {e}")
+            return ToolResult(
+                success=False,
+                data={},
+                message=f"도구 실행 중 오류 발생: {e}"
+            )
+
+    def _tool_get_game_lineup(self, game_id: str = None, date: str = None, team_name: str = None) -> ToolResult:
+        """경기 라인업 조회 도구"""
+        try:
+            result = self.game_query_tool.get_game_lineup(game_id, date, team_name)
+            
+            if result.get("error"):
+                return ToolResult(
+                    success=False,
+                    data=result,
+                    message=f"라인업 조회 오류: {result['error']}"
+                )
+            
+            if not result["found"]:
+                query_info = f"ID: {game_id}" if game_id else f"날짜: {date}"
+                if team_name:
+                    query_info += f", 팀: {team_name}"
+                return ToolResult(
+                    success=False,
+                    data=result,
+                    message=f"{query_info}에 대한 라인업 정보를 찾을 수 없습니다."
+                )
+            
+            return ToolResult(
+                success=True,
+                data=result,
+                message=f"라인업 조회를 성공했습니다. ({len(result['lineups'])}명의 선수)"
+            )
+            
+        except Exception as e:
+            logger.error(f"Lineup tool error: {e}")
             return ToolResult(
                 success=False,
                 data={},
@@ -827,6 +878,36 @@ class BaseballStatisticsAgent:
             
         except Exception as e:
             logger.error(f"Team summary tool error: {e}")
+            return ToolResult(
+                success=False,
+                data={},
+                message=f"도구 실행 중 오류 발생: {e}"
+            )
+
+    def _tool_get_team_advanced_metrics(self, team_name: str, year: int) -> ToolResult:
+        """팀 심층 지표 조회 도구 래퍼"""
+        try:
+            result = self.db_query_tool.get_team_advanced_metrics(team_name, year)
+            
+            if result.get("error"):
+                return ToolResult(
+                    success=False,
+                    data=result,
+                    message=f"심층 지표 조회 오류: {result['error']}"
+                )
+            
+            # AI가 판단하기 쉽게 불펜 과부하 여부를 포함한 메시지 생성
+            share = result.get("fatigue_index", {}).get("bullpen_share", "0%")
+            avg_share = result.get("league_averages", {}).get("bullpen_share", "0%")
+            
+            return ToolResult(
+                success=True,
+                data=result,
+                message=f"{year}년 {team_name} 심층 지표 조회 완료. (불펜 비중: {share}, 리그 평균: {avg_share})"
+            )
+            
+        except Exception as e:
+            logger.error(f"Team advanced metrics tool error: {e}")
             return ToolResult(
                 success=False,
                 data={},
@@ -1104,6 +1185,78 @@ class BaseballStatisticsAgent:
                 message=f"도구 실행 중 오류 발생: {e}"
             )
 
+    def _tool_get_recent_games_by_team(self, team_name: str, limit: int = 5) -> ToolResult:
+        """팀 최근 경기 조회 도구"""
+        try:
+            result = self.game_query_tool.get_team_recent_games(team_name, limit)
+            
+            if result["error"]:
+                return ToolResult(
+                    success=False,
+                    data=result,
+                    message=f"최근 경기 조회 오류: {result['error']}"
+                )
+            
+            if not result["found"]:
+                return ToolResult(
+                    success=False,
+                    data=result,
+                    message=f"{team_name} 팀의 최근 경기 기록을 찾을 수 없습니다."
+                )
+            
+            return ToolResult(
+                success=True,
+                data=result,
+                message=f"{team_name} 팀의 최근 {len(result['games'])}경기 기록을 성공적으로 조회했습니다."
+            )
+            
+        except Exception as e:
+            logger.error(f"Team recent games tool error: {e}")
+            return ToolResult(
+                success=False,
+                data={},
+                message=f"도구 실행 중 오류 발생: {e}"
+            )
+
+    def _tool_get_advanced_stats(self, player_name: str, year: int, position: str = "both") -> ToolResult:
+        """고급 통계 조회 도구"""
+        try:
+            result = self.db_query_tool.get_advanced_stats(player_name, year, position)
+            
+            if "error" in result and result["error"]:
+                return ToolResult(
+                    success=False,
+                    data=result,
+                    message=f"고급 통계 조회 중 오류 발생: {result['error']}"
+                )
+            
+            if not result["found"]:
+                return ToolResult(
+                    success=False,
+                    data=result,
+                    message=f"{year}년에 '{player_name}' 선수의 고급 통계 데이터를 찾을 수 없습니다."
+                )
+                
+            return ToolResult(
+                success=True,
+                data=result,
+                message=f"{year}년 {player_name} 선수의 고급 통계(ERA+, OPS+, FIP 등)를 성공적으로 조회했습니다."
+            )
+            
+        except Exception as e:
+            logger.error(f"Advanced stats tool error: {e}")
+            return ToolResult(
+                success=False,
+                data={},
+                message=f"고급 통계 도구 실행 중 오류 발생: {e}"
+            )
+            logger.error(f"Recent games tool error: {e}")
+            return ToolResult(
+                success=False,
+                data={},
+                message=f"도구 실행 중 오류 발생: {e}"
+            )
+
     def _tool_get_head_to_head(
         self, 
         team1: str, 
@@ -1281,28 +1434,22 @@ class BaseballStatisticsAgent:
                 if not team_id:
                     team_id = team_name  # 직접 매핑 실패시 원본 사용
                 
-                # v_team_rank_all 뷰에서 팀 순위 조회 (올바른 컬럼명 사용)
-                cursor.execute("""
-                    SELECT season_rank, team_name
-                    FROM v_team_rank_all 
-                    WHERE (team_id = %s OR team_name LIKE %s) 
-                    AND season_year = %s
-                """, [team_id, f'%{team_name}%', year])
+                # v_team_rank_all 뷰 대신 동적 계산 도구 사용
+                rank_result = self.db_query_tool.get_team_season_rank(team_name, year)
                 
-                result = cursor.fetchone()
-                
-                if result:
-                    season_rank, full_team_name = result
+                if rank_result["found"]:
                     return ToolResult(
                         success=True,
                         data={
-                            "team_name": full_team_name,
-                            "team_rank": season_rank,  # API 호환성을 위해 team_rank로 반환
-                            "season_rank": season_rank,  # 실제 DB 컬럼명
+                            "team_name": rank_result["team_name"],
+                            "team_rank": rank_result["rank"],
+                            "season_rank": rank_result["rank"],
+                            "wins": rank_result["wins"],
+                            "losses": rank_result["losses"],
                             "year": year,
                             "found": True
                         },
-                        message=f"{full_team_name}의 {year}년 최종 순위: {season_rank}등"
+                        message=f"{rank_result['team_name']}의 {year}년 정규시즌 최종 순위: {rank_result['rank']}위 ({rank_result['wins']}승 {rank_result['losses']}패)"
                     )
                 else:
                     return ToolResult(
@@ -1314,6 +1461,7 @@ class BaseballStatisticsAgent:
                         },
                         message=f"{team_name}의 {year}년 순위 정보를 찾을 수 없습니다"
                     )
+
                     
         except Exception as e:
             logger.error(f"[BaseballAgent] Team rank query error: {e}")
@@ -1341,23 +1489,40 @@ class BaseballStatisticsAgent:
             
             logger.info(f"[BaseballAgent] {team_name} {year}년 순위: {team_rank}, 리그 타입: {league_type}")
             
-            # 2단계: 해당 리그 타입의 마지막 경기 조회
-            final_game_result = self._tool_get_season_final_game_date(year, league_type)
+            # 2단계: 해당 팀의 실제 마지막 경기 날짜 조회
+            final_date_result = self.game_query_tool.get_team_last_game_date(team_name, year, league_type)
             
-            if not final_game_result.success:
+            if not final_date_result.get("found"):
+                # 팀별 마지막 날짜를 못 찾으면 전체 시즌 마지막 날짜로 폴백
+                logger.warning(f"[BaseballAgent] 팀별 마지막 경기 날짜를 못 찾음 ({team_name}, {year}). 전체 시즌 날짜로 시도.")
+                final_game_result = self.game_query_tool.get_season_final_game_date(year, league_type)
+                if not final_game_result.get("found"):
+                    return ToolResult(
+                        success=False,
+                        data={"team_name": team_name, "year": year},
+                        message=f"{team_name}의 {year}년 {league_type} 마지막 경기 정보를 찾을 수 없습니다"
+                    )
+                final_date = final_game_result["final_game_date"]
+            else:
+                final_date = final_date_result["last_game_date"]
+
+            # 3단계: 해당 날짜의 경기 결과 조회
+            games_result = self.game_query_tool.get_games_by_date(final_date)
+            
+            if not games_result.get("found"):
                 return ToolResult(
                     success=False,
                     data={
                         "team_name": team_name,
                         "year": year,
                         "team_rank": team_rank,
-                        "league_type": league_type
+                        "final_date": final_date
                     },
-                    message=f"{team_name}의 {year}년 마지막 경기를 찾을 수 없습니다"
+                    message=f"{team_name}의 {year}년 {league_type} 마지막 경기({final_date}) 결과 조회 실패"
                 )
             
             # 3단계: 해당 팀의 경기만 필터링
-            games = final_game_result.data.get("formatted_games", [])
+            games = games_result.get("games", [])
             team_games = []
             
             # 팀명을 동적으로 매핑
@@ -1377,7 +1542,7 @@ class BaseballStatisticsAgent:
                 "year": year,
                 "team_rank": team_rank,
                 "league_type": league_type,
-                "final_date": final_game_result.data.get("final_date"),
+                "final_date": final_date,
                 "team_games": team_games,
                 "all_games": games,
                 "postseason_qualified": team_rank <= 5 if team_rank else None
@@ -1477,7 +1642,11 @@ class BaseballStatisticsAgent:
             }
             
             rank_text = f" (정규시즌 {winner_rank}위)" if winner_rank else ""
-            message = f"{year}년 한국시리즈 우승팀: {winner_team_name}{rank_text}"
+            final_score = f"{final_game.get('away_score')}:{final_game.get('home_score')}"
+            stadium_text = f" ({final_game.get('stadium')})" if final_game.get('stadium') else ""
+            
+            message = f"{year}년 한국시리즈 우승팀: {winner_team_name}{rank_text}. "
+            message += f"결승전 결과: {final_game.get('away_team_name')} {final_score} {final_game.get('home_team_name')}{stadium_text} ({final_game.get('game_date')})"
             
             return ToolResult(
                 success=True,
@@ -1688,11 +1857,33 @@ class BaseballStatisticsAgent:
         
         # 2단계: 도구 실행을 통한 데이터 수집
         tool_results = []
+        valid_tool_calls = []
+        
+        # --- 신규 추가: 매개변수 환각 필터링 (Defensive Validation) ---
+        hallucination_indicators = ["추출된", "결과", "로부터", "STEP", "FROM", "찾은", "확인된", "날짜", "선수명"]
+        
         for tool_call in analysis_result["tool_calls"]:
-            logger.info(f"[BaseballAgent] Executing tool: {tool_call.tool_name}")
-            result = self.tool_caller.execute_tool(tool_call)
-            tool_results.append(result)
+            is_hallucination = False
+            for param_val in tool_call.parameters.values():
+                if isinstance(param_val, str) and any(indicator in param_val.upper() for indicator in hallucination_indicators):
+                    is_hallucination = True
+                    break
             
+            if is_hallucination:
+                logger.warning(f"[BaseballAgent] Hallucination detected in {tool_call.tool_name} params: {tool_call.parameters}")
+                # 환각된 도구는 실행하지 않고 빈 결과/메시지만 남김
+                from .tool_caller import ToolResult
+                tool_results.append(ToolResult(
+                    success=False,
+                    data={},
+                    message=f"매개변수 오류: {tool_call.tool_name} 호출을 위한 유효한 데이터를 찾지 못했습니다."
+                ))
+            else:
+                logger.info(f"[BaseballAgent] Executing tool: {tool_call.tool_name}")
+                result = self.tool_caller.execute_tool(tool_call)
+                tool_results.append(result)
+                valid_tool_calls.append(tool_call)
+        
         # 3단계: 수집된 실제 데이터를 바탕으로 답변 생성
         answer_result = await self._generate_verified_answer(query, tool_results, context)
         
@@ -1720,17 +1911,8 @@ class BaseballStatisticsAgent:
         now = datetime.now()
         current_year = now.year
         current_date = now.strftime("%Y년 %m월 %d일")
-        year_replacements = {
-            "재작년": str(now.year - 2),
-            "작년": str(now.year - 1),
-            "올해": str(now.year),
-            "내년": str(now.year + 1),
-        }
-
+        # 시간 표현 전처리 (프롬프트에서 처리하므로 파이썬 측 치환 로직 제거)
         processed_query = query
-        for keyword, year_str in year_replacements.items():
-            if keyword in processed_query:
-                processed_query = processed_query.replace(keyword, f"{year_str}년")
 
         # LLM을 사용하여 질문을 분석하고 도구 사용 계획 수립
         
@@ -1756,193 +1938,7 @@ class BaseballStatisticsAgent:
             entity_context = "\n\n### 질문에서 분석된 정보:\n" + "\n".join(entity_context_parts)
 
         query_text = processed_query # 전처리된 쿼리 사용
-        analysis_prompt_template = """
-당신은 야구 통계 전문 에이전트입니다. 사용자의 질문을 분석하고 실제 데이터베이스에서 정확한 답변을 얻기 위해 어떤 도구들을 사용해야 하는지 결정해야 합니다.
-
-**현재날짜: {current_date}**
-**현재년도: {current_year}년**
-작년: {last_year}년
-재작년: {two_years_ago}년
-
-질문: {query_text}
-
-사용 가능한 도구들과 정확한 매개변수:
-
-1. **get_player_stats**: 특정 선수의 개별 시즌 통계 조회
-   - player_name (필수): 선수명
-   - year (필수): 시즌 년도 (기본값: current_year = {current_year})
-   - position (선택): "batting", "pitching", "both" 중 하나 (기본값: "both")
-
-2. **get_leaderboard**: 통계 지표별 순위/리더보드 조회  
-   - stat_name (필수): 통계 지표명 (예: "home_runs", "era", "ops", "타율")
-   - year (필수): 시즌 년도 (기본값: current_year = {current_year})
-   - position (필수): "batting" 또는 "pitching"
-   - team_filter (선택): 특정 팀명 (예: "KIA", "LG")
-   - limit (선택): 상위 몇 명까지 (기본값: 10)
-
-3. **validate_player**: 선수 존재 여부 및 정확한 이름 확인
-   - player_name (필수): 선수명
-   - year (선택): 시즌 년도 (기본값: current_year = {current_year})
-
-4. **get_career_stats**: 선수의 통산(커리어) 통계 조회
-   - player_name (필수): 선수명
-   - position (선택): "batting", "pitching", "both" 중 하나 (기본값: "both")
-
-5. **get_team_summary**: 팀의 주요 선수들과 통계 조회
-   - team_name (필수): 팀명 (예: "KIA", "기아")
-   - year (필수): 시즌 년도 (기본값: current_year = {current_year})
-
-6. **get_position_info**: 포지션 약어를 전체 포지션명으로 변환
-   - position_abbr (필수): 포지션 약어 (예: "지", "포", "一", "二", "三")
-
-7. **get_team_basic_info**: 팀의 기본 정보 조회
-   - team_name (필수): 팀명 (예: "KIA", "LG", "두산")
-
-8. **get_defensive_stats**: 선수의 수비 통계 조회
-   - player_name (필수): 선수명
-   - year (선택): 시즌 년도 (생략하면 통산) 
-
-9. **get_velocity_data**: 투수의 구속 데이터 조회
-   - player_name (필수): 선수명
-   - year (선택): 시즌 년도 (생략하면 최근 데이터)
-
-10. **search_regulations**: KBO 규정 검색
-    - query (필수): 검색할 규정 내용 (예: "타이브레이크", "FA 조건", "인필드 플라이")
-
-11. **get_regulations_by_category**: 카테고리별 규정 조회
-    - category (필수): 규정 카테고리 (basic, player, game, technical, discipline, postseason, special, terms)
-
-12. **get_game_box_score**: 특정 경기의 박스스코어와 상세 정보 조회
-    - game_id (선택): 경기 고유 ID
-    - date (선택): 경기 날짜 (YYYY-MM-DD)
-    - home_team (선택): 홈팀명
-    - away_team (선택): 원정팀명
-
-13. **get_games_by_date**: 특정 날짜의 모든 경기 조회
-    - date (필수): 경기 날짜 (YYYY-MM-DD)
-    - team (선택): 특정 팀만 조회
-
-14. **get_head_to_head**: 두 팀 간의 직접 대결 기록 조회
-    - team1 (필수): 팀1 이름
-    - team2 (필수): 팀2 이름
-    - year (선택): 시즌 년도
-    - limit (선택): 최근 몇 경기까지 (기본 10경기)
-
-15. **get_player_game_performance**: 특정 선수의 개별 경기 성적 조회
-    - player_name (필수): 선수명
-    - date (선택): 경기 날짜
-    - recent_games (선택): 최근 몇 경기까지 (기본 5경기)
-
-16. **compare_players**: 두 선수의 통계를 비교 분석
-    - player1 (필수): 첫 번째 선수명
-    - player2 (필수): 두 번째 선수명
-    - comparison_type (선택): "career"(통산 비교, 기본값) 또는 "season"(특정 시즌 비교)
-    - year (선택): 특정 시즌 비교 시 연도
-    - position (선택): "batting", "pitching", "both" 중 하나 (기본값: "both")
-
-17. **get_season_final_game_date**: 특정 시즌의 마지막 경기 날짜를 조회
-   - year (필수): 시즌 년도 (기본값: current_year = {current_year})
-   - league_type (선택): "regular_season" 또는 "korean_series" (기본값: "korean_series")
-
-18. **get_team_rank**: 특정 시즌의 팀 최종 순위를 조회
-   - team_name (필수): 팀명 (예: "KIA", "기아", "SSG")
-   - year (필수): 시즌 년도 (기본값: current_year = {current_year})
-
-19. **get_team_last_game**: 특정 팀의 실제 마지막 경기를 지능적으로 조회
-   - team_name (필수): 팀명 (예: "SSG", "기아", "KIA")
-   - year (필수): 시즌 년도 (기본값: current_year = {current_year})
-   - 자동으로 팀 순위를 확인하여 포스트시즌 진출팀(1-5위)은 한국시리즈, 미진출팀(6-10위)은 정규시즌 마지막 경기를 조회
-
-20. **get_korean_series_winner**: 특정 시즌의 한국시리즈 우승팀을 조회
-   - year (필수): 시즌 년도 (기본값: current_year = {current_year})
-   - 우승팀과 함께 정규시즌 순위 정보도 제공
-
-21. **get_current_datetime**: 현재 날짜와 시간 조회
-    - "지금 몇 시", "오늘 날짜" 질문에 사용
-
-22. **get_baseball_season_info**: 현재 야구 시즌 정보 조회
-    - "지금 몇 시", "오늘 날짜" 질문에 사용
-    - "지금 야구 시즌이야?", "시즌 중" 질문에 사용
-
-23. **search_documents**: KBO 리그 규정, 용어 정의, 선수 관련 스토리 등 비정형 텍스트 문서를 검색합니다.
-    - query (필수): 검색할 질문 또는 키워드
-    - 'ABS가 뭐야?', 'FA 규정 알려줘'와 같은 설명형/정의형 질문에 사용
-
-23. **search_documents**: KBO 리그 규정, 용어 정의 등 비정형 텍스트 문서 검색
-    - query (필수): 검색할 질문 또는 키워드
-    - 'ABS가 뭐야?', 'FA 규정 알려줘'와 같은 설명형/정의형 질문에 사용
-
-질문: {query}
-
-**중요한 규칙:**
-- "우승팀", "챔피언", "한국시리즈 우승" 질문은 get_korean_series_winner 사용 (자동으로 우승팀과 순위 정보 제공)
-- 시즌이 명시되지 않으면 current_year({current_year})을 기본값으로 사용
-- "통산", "커리어", "총", "KBO 리그 통산" 키워드가 있으면 반드시 get_career_stats 사용
-- "세이브" 키워드가 포함된 통산 기록 질문은 get_career_stats 사용
-- "몇 년", "2025년" 등 구체적 연도가 있으면 get_player_stats 사용
-- "가장 많은", "최고", "언제", "어느 시즌" 등 최고 기록 시즌을 묻는 질문:
-  * 먼저 get_career_stats로 통산 기록 확인
-  * 필요시 여러 연도의 get_player_stats로 연도별 비교
-- "마지막 경기", "최종전" 질문: 특정 팀이 언급되면 get_team_last_game을 우선 사용 (자동으로 순위 확인 후 적절한 리그의 마지막 경기 조회). 전체 리그 마지막 경기는 get_season_final_game_date 사용
-- "결승전", "우승" 질문은 get_season_final_game_date(league_type='korean_series') 사용
-- 팀 순위 질문("몇 등", "순위", "몇 위")은 get_team_rank 사용
-- 순위/리더보드 질문은 get_leaderboard 사용
-- 경기 결과, 박스스코어 질문은 get_game_box_score 사용
-- 특정 날짜 경기 질문("5월 5일 경기", "어린이날")은 get_games_by_date 사용
-- 시즌 일정 질문("언제부터 시작", "시범경기 일정")은 get_games_by_date 사용
-- 팀 간 맞대결 질문은 get_head_to_head 사용
-- 포스트시즌("한국시리즈", "플레이오프") 질문은 get_games_by_date 사용
-- 선수 개별 경기 활약 질문은 get_player_game_performance 사용
-- 선수 비교 질문("A vs B", "A와 B 중 누가", "더 뛰어난")은 compare_players 사용
-- 통산 기록 비교는 comparison_type="career", 특정 시즌 비교는 comparison_type="season"
-
-위 질문에 정확히 답변하기 위해 어떤 도구들을 어떤 순서로 호출해야 하는지 JSON 형식으로 계획을 세워주세요.
-**절대 금지사항**: 
-- "DATE_FROM_STEP_1", "YEAR_FROM_CONTEXT", "<date_from_relevant_get_season_final_game_date>" 같은 플레이스홀더 텍스트를 절대 사용하지 마세요
-- 매개변수 값은 반드시 실제 구체적인 값을 사용하세요
-
-**질문 유형별 도구 선택 예시**:
-- "작년 SSG 마지막 경기" → get_team_last_game(team_name="SSG", year: {last_year})
-- "2025시즌 정규시즌 최종전" → get_season_final_game_date(year=2025, league_type="regular_season")  
-- "기아 마지막 경기" → get_team_last_game(team_name="기아", year: {last_year})
-- "한국시리즈 마지막 경기" → get_season_final_game_date(year: {last_year}, league_type="korean_series")
-- "작년 우승팀은?" → get_korean_series_winner(year: {last_year})
-- "2024년 한국시리즈 챔피언" → get_korean_series_winner(year=2024)
-
-중요한 원칙:
-- 반드시 실제 데이터베이스 조회가 필요한 경우만 도구를 사용하세요
-- 선수명이 불확실한 경우 먼저 validate_player로 확인하세요
-- 리그 전체 순위("최고", "상위", "1위")는 get_leaderboard를 사용하세요
-- 특정 선수의 개별 시즌 통계는 get_player_stats를 사용하세요
-- 특정 선수의 통산/커리어 기록은 get_career_stats를 사용하세요
-- 특정 선수의 "가장 좋은 시즌" 질문은 get_career_stats + 여러 연도 get_player_stats 조합
-- 경기 일정/결과는 get_games_by_date 또는 get_game_box_score 사용하세요
-- 날짜 형식은 YYYY-MM-DD로 변환하세요 (기본값: current_year = {current_year}, 
-예: "5월 5일" → "{current_year}-05-05")
-- 연도 정보가 없는 경우 현재 연도를 기본값으로 사용하세요
-- "재작년", "제작년" → {two_years_ago}, 
-"작년", "지난해" → {last_year}, 
-"올해" → {current_year}로 자동 변환하세요
-- 상대적 연도 표현은 현재 연도를 기반으로 동적으로 계산하세요
-
-**반드시 다음 JSON 형식으로만 응답하세요:**
-```json
-{{
-    "analysis": "질문 분석 내용",
-    "tool_calls": [
-        {{
-            "tool_name": "도구명",
-            "parameters": {{
-                "매개변수명": "값"
-            }},
-            "reasoning": "이 도구를 사용하는 이유"
-        }}
-    ],
-    "expected_result": "예상되는 답변 유형"
-}}
-```
-"""
-        analysis_prompt = analysis_prompt_template.format(
+        analysis_prompt = SYSTEM_PROMPT.format(
             current_date=current_date,
             current_year=current_year,
             last_year=current_year - 1,
@@ -1956,7 +1952,12 @@ class BaseballStatisticsAgent:
         try:
             # LLM 호출하여 분석 결과 받기
             analysis_messages = [{"role": "user", "content": analysis_prompt}]
-            raw_response = await self.llm_generator(analysis_messages)
+            
+            # 스트리밍 API인 경우 전체 응답을 모아서 처리
+            raw_response = ""
+            async for chunk in self.llm_generator(analysis_messages):
+                if chunk:
+                    raw_response += chunk
             
             logger.info(f"[BaseballAgent] Raw LLM response: {raw_response[:200]}...")
             
@@ -1989,6 +1990,39 @@ class BaseballStatisticsAgent:
             try:
                 cleaned_json = clean_json_response(json_content)
                 analysis_data = json.loads(cleaned_json)
+                
+                # --- Year Correction Logic ---
+                try:
+                    from ..core.entity_extractor import extract_entities_from_query
+                    import datetime as dt
+                    entity_filter = extract_entities_from_query(query)
+                    current_year = dt.datetime.now().year
+                    
+                    # 명시적으로 추출된 연도가 있는 경우 (예: "작년" -> 2025)
+                    if entity_filter.season_year:
+                        extracted_year = entity_filter.season_year
+                        for call_data in analysis_data.get("tool_calls", []):
+                            params = call_data.get("parameters", {})
+                            if "year" in params:
+                                llm_year = params["year"]
+                                # 1. LLM이 현재/미래 연도를 제시했으나 추출된 연도는 과거인 경우 보정 (예: "작년" -> 2025)
+                                if isinstance(llm_year, int) and llm_year >= current_year and extracted_year < current_year:
+                                    logger.info(f"[BaseballAgent] Correcting year {llm_year} -> {extracted_year} based on entity extraction")
+                                    params["year"] = extracted_year
+                                
+                                # 2. Pre-season 로직: 1-3월인데 올해(2026)를 조회하려는 경우 (데이터가 없으므로 2025로 강제 보정)
+                                # 단, 명시적으로 미래를 묻는 쿼리가 아닐 때만
+                                elif isinstance(llm_year, int) and llm_year == current_year and now.month <= 3:
+                                    # 통계 관련 도구인 경우에만 적용
+                                    stat_related_tools = ["get_leaderboard", "get_player_stats", "get_team_summary", "get_team_rank"]
+                                    if call_data.get("tool_name") in stat_related_tools:
+                                        # "내년", "2026년" 같은 명시적 표현이 없는지 확인
+                                        if not any(word in query for word in ["내년", "다가오는", str(current_year)]):
+                                            logger.info(f"[BaseballAgent] Pre-season override: {llm_year} -> {current_year-1}")
+                                            params["year"] = current_year - 1
+                except Exception as e:
+                    logger.warning(f"[BaseballAgent] Year correction failed: {e}")
+                # -----------------------------
             except json.JSONDecodeError as e:
                 logger.error(f"[BaseballAgent] JSON parsing error: {e}")
                 logger.error(f"[BaseballAgent] Original content: {json_content}")
@@ -2026,18 +2060,58 @@ class BaseballStatisticsAgent:
             query_lower = query.lower()
             
             # 선수명 추출 시도
-            import re
-            korean_names = re.findall(r'[가-힣]{2,4}', query)
-            potential_player_name = korean_names[0] if korean_names else entity_filter.player_name
+            from ..core.entity_extractor import TEAM_MAPPING
+            potential_player_name = entity_filter.player_name
+            
+            if not potential_player_name:
+                import re
+                words = re.findall(r'[가-힣]{2,4}', query)
+                # 공통 용어 및 팀명 제외
+                from ..core.entity_extractor import extract_player_name
+                # extract_player_name의 내부 로직을 활용하거나 직접 필터링
+                common_terms = {
+                    "순위", "성적", "기록", "랭킹", "정규시즌", "데이터", "확인",
+                    "투수", "타자", "선수", "팀명", "구단", "홈런", "안타", "타점",
+                    "알려줘", "설명해줘", "보여줘", "부탁해", "어딨어", "누구야",
+                    "작년", "올해", "재작년", "내년", "승률", "몇승", "몇패",
+                    "상대", "특정", "결과", "대결", "승부", "위가", "경기", "어떤", "무슨"
+                }
+
+                for word in words:
+                    # 팀 이름 매핑 키 필터링
+                    if word not in common_terms and word not in TEAM_MAPPING:
+                        potential_player_name = word
+                        break
             
             # 질문에서 추출된 값들 사용
             extracted_year = entity_filter.season_year or current_year
-            extracted_stat = entity_filter.stat_type or "ops"  # 기본값
-            extracted_position = entity_filter.position_type or "batting"  # 기본값
+            extracted_stat = entity_filter.stat_type or "ops"
+            extracted_position = entity_filter.position_type or "both"
             
-            # 통산/커리어 질문 감지
-            if any(word in query_lower for word in ["통산", "커리어", "총", "kbo 리그"]):
-                if potential_player_name:
+            # 규정/규칙 질문 감지
+            regulation_keywords = ["규정", "규칙", "제도", "요건", "자격", "기준", "공식", "FA", "연봉", "드래프트", "엔트리", "피치클락", "ABS", "로봇심판", "베이스", "시프트"]
+            if any(keyword in query for keyword in regulation_keywords):
+                fallback_tool = ToolCall(
+                    tool_name="search_regulations",
+                    parameters={"query": query}
+                )
+                analysis = f"규정/규칙 관련 질문: '{query}'"
+            
+            # 팀 순위 질문 감지
+            elif entity_filter.team_id and any(word in query_lower for word in ["순위", "성적", "기록", "랭킹", "정규시즌"]):
+                fallback_tool = ToolCall(
+                    tool_name="get_team_rank",
+                    parameters={
+                        "team_name": entity_filter.team_id,
+                        "year": extracted_year
+                    }
+                )
+                analysis = f"'{entity_filter.team_id}' 팀의 {extracted_year}년 성적 조회"
+            
+            # 선수 성적 질문 감지
+            elif potential_player_name:
+                # 통산/커리어 질문 감지
+                if any(word in query_lower for word in ["통산", "커리어", "총", "kbo 리그"]):
                     fallback_tool = ToolCall(
                         tool_name="get_career_stats",
                         parameters={
@@ -2074,107 +2148,95 @@ class BaseballStatisticsAgent:
                         extracted_date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
                         break
                 
-                if extracted_date:
-                    fallback_tool = ToolCall(
-                        tool_name="get_games_by_date",
-                        parameters={
-                            "date": extracted_date
-                        }
-                    )
-                    analysis = f"{extracted_date} 경기 결과 조회"
-                else:
-                    # 이미 추출된 연도 사용
-                    fallback_tool = ToolCall(
-                        tool_name="get_games_by_date", 
-                        parameters={
-                            "date": f"{extracted_year}-03-01"  # 기본값으로 시즌 시작 시점
-                        }
-                    )
-                    analysis = f"{extracted_year}년 경기 정보 조회"
-                    
-            # 가장 많은/최고 시즌 질문 감지
-            elif any(word in query_lower for word in ["가장 많은", "최고", "언제", "어느 시즌", "어떤 년도"]):
-                if potential_player_name:
-                    fallback_tool = ToolCall(
-                        tool_name="get_career_stats",
-                        parameters={
-                            "player_name": potential_player_name,
-                            "position": "both"
-                        }
-                    )
-                    analysis = f"{potential_player_name} 선수의 최고 시즌 조회를 위한 통산 기록 확인"
-                else:
-                    # 질문에서 "홈런" 언급이 있으면 home_runs, 없으면 기본값
-                    stat_for_max = "home_runs" if "홈런" in query_lower else extracted_stat
-                    fallback_tool = ToolCall(
-                        tool_name="get_leaderboard",
-                        parameters={
-                            "stat_name": stat_for_max,
-                            "year": extracted_year,
-                            "position": extracted_position,
-                            "limit": 10
-                        }
-                    )
-                    analysis = f"최고 기록 관련 질문으로 판단하여 {stat_for_max} 순위 조회"
-                    
-            # 투수 질문 감지  
-            elif any(word in query_lower for word in ["투수", "투구", "방어율", "era", "whip", "승", "세이브"]):
-                if potential_player_name:
-                    fallback_tool = ToolCall(
-                        tool_name="get_career_stats",
-                        parameters={
-                            "player_name": potential_player_name,
-                            "position": "pitching"
-                        }
-                    )
-                    analysis = f"{potential_player_name} 투수의 통산 기록 조회"
-                else:
-                    # 투수 질문에서 특정 통계가 언급되면 사용, 없으면 ERA 기본값
-                    pitcher_stat = extracted_stat if extracted_stat in ["era", "whip", "wins", "saves", "strikeouts", "innings_pitched"] else "era"
-                    fallback_tool = ToolCall(
-                        tool_name="get_leaderboard",
-                        parameters={
-                            "stat_name": pitcher_stat,
-                            "year": extracted_year,
-                            "position": "pitching",
-                            "limit": 10
-                        }
-                    )
-                    analysis = f"투수 관련 질문으로 판단하여 {pitcher_stat} 기준 상위 투수 조회"
+                # --- 고도화된 Fallback 로직 시작 ---
+            fallback_tool = None
+            analysis = "LLM 응답 분석 실패로 인한 규칙 기반 Fallback 도구 선택"
             
-            # 타자 질문 감지 (기본값)
-            else:
-                if potential_player_name:
+            # 1. 한국시리즈/우승팀 질문 (get_korean_series_winner)
+            if any(word in query_lower for word in ["우승", "한국시리즈", "코리안시리즈", "결승"]):
+                fallback_tool = ToolCall(
+                    tool_name="get_korean_series_winner",
+                    parameters={"year": extracted_year}
+                )
+                analysis = f"{extracted_year}년 한국시리즈/우승팀 정보 조회 (Fallback)"
+            
+            # 2. 팀 순위/성적 질문 (get_team_rank)
+            elif any(word in query_lower for word in ["순위", "성적", "기록", "랭킹", "승률", "몇승", "몇패"]):
+                # 팀이 명시되었거나 "팀별"인 경우
+                team_name = potential_player_name if potential_player_name and any(t in query_lower for t in ["기아", "삼성", "엘지", "두산", "롯데", "키움", "한화", "엔씨", "에스에스지", "케이티"]) else entity_filter.team_id
+                
+                if team_name:
                     fallback_tool = ToolCall(
-                        tool_name="get_career_stats",
-                        parameters={
-                            "player_name": potential_player_name,
-                            "position": "batting"
-                        }
+                        tool_name="get_team_rank",
+                        parameters={"team_name": team_name, "year": extracted_year}
                     )
-                    analysis = f"{potential_player_name} 선수의 타격 통계 조회"
+                    analysis = f"{extracted_year}년 {team_name} 팀 성적/순위 조회 (Fallback)"
                 else:
-                    # 타자 질문에서 특정 통계가 언급되면 사용, 없으면 OPS 기본값  
-                    batter_stat = extracted_stat if extracted_stat in ["ops", "avg", "home_runs", "rbi", "stolen_bases", "war", "wrc_plus"] else "ops"
+                    # 팀이 명시되지 않은 전체 순위 질문이면 리더보드로 (정규시즌 순위 개념)
                     fallback_tool = ToolCall(
-                        tool_name="get_leaderboard", 
+                        tool_name="get_leaderboard",
                         parameters={
-                            "stat_name": batter_stat,
+                            "stat_name": "ops", # 팀 순위 대용 (정규시즌 리더보드)
                             "year": extracted_year,
                             "position": "batting",
                             "limit": 10
                         }
                     )
-                    analysis = f"타자 관련 질문으로 판단하여 {batter_stat} 기준 상위 타자 조회"
+                    analysis = f"{extracted_year}년 전체 팀 순위/리더보드 조회 (Fallback)"
+
+            # 3. 선수 개인 기록 질문 
+            elif potential_player_name and not any(word in query_lower for word in ["순위", "리더보드", "랭킹"]):
+                fallback_tool = ToolCall(
+                    tool_name="get_career_stats",
+                    parameters={
+                        "player_name": potential_player_name,
+                        "position": entity_filter.position_type or "both"
+                    }
+                )
+                analysis = f"{potential_player_name} 선수의 통계 조회 (Fallback)"
+
+            # 4. 특정 통계 리더보드 질문
+            elif entity_filter.stat_type:
+                pos = entity_filter.position_type
+                if not pos:
+                    # 지표로 포지션 추측
+                    if entity_filter.stat_type in ["era", "whip", "wins", "saves", "strikeouts", "innings_pitched"]:
+                        pos = "pitching"
+                    else:
+                        pos = "batting"
+                
+                fallback_tool = ToolCall(
+                    tool_name="get_leaderboard",
+                    parameters={
+                        "stat_name": entity_filter.stat_type,
+                        "year": extracted_year,
+                        "position": pos,
+                        "limit": 10
+                    }
+                )
+                analysis = f"{extracted_year}년 {entity_filter.stat_type} 리더보드 조회 (Fallback)"
+
+            # 5. 최후의 보루 (OPS 리더보드)
+            if not fallback_tool:
+                fallback_tool = ToolCall(
+                    tool_name="get_leaderboard",
+                    parameters={
+                        "stat_name": "ops",
+                        "year": extracted_year,
+                        "position": "batting",
+                        "limit": 10
+                    }
+                )
+                analysis = "질문 의도 파악이 어려워 기본 리더보드(OPS) 조회 (Fallback)"
             
             return {
                 "analysis": analysis,
                 "tool_calls": [fallback_tool],
-                "expected_result": "리더보드 순위",
+                "expected_result": "조회 결과",
                 "error": None
             }
         except Exception as e:
-            logger.error(f"[BaseballAgent] Error in query analysis: {e}")
+            logger.exception(f"[BaseballAgent] Error in query analysis: {e}")
             return {
                 "analysis": "",
                 "tool_calls": [],
@@ -2243,62 +2305,37 @@ class BaseballStatisticsAgent:
                     "error": result.message
                 })
         
-        # 검증된 데이터만 사용하여 답변 생성
-        answer_prompt = f"""
-안녕하세요! KBO 야구 데이터를 다루는 BEGA입니다.
+        # 프롬프트 선택 로직
+        persona = context.get('persona') if context else None
+        prompt_override = context.get('prompt_override') if context else None
+        
+        tool_data_text = chr(10).join(tool_data_summary)
 
-사용자 질문: {query}{time_context}
-
-조회된 기록:
-{chr(10).join(tool_data_summary)}
-
-다음 가이드라인에 따라 자연스럽고 친근하게 답변해주세요:
-
-**중요 - 연도 처리:**
-- 조회된 데이터의 연도(year 필드)를 그대로 사용하세요
-- 절대로 연도를 재계산하거나 추측하지 마세요
-- 데이터에 "year: 2023"이 있으면 → "2023년"이라고 답변
-- "재작년", "작년" 같은 표현은 이미 정확한 연도로 변환되어 조회되었습니다
-
-답변 스타일:
-- 친구에게 설명하듯 편안하고 자연스럽게
-- "기록을 확인해보니", "데이터를 살펴보면", "최신 정보로는" 등의 자연스러운 표현
-- 실제 야구 해설위원이나 스포츠 기자가 답변하는 톤
-
-팀 순위 정보가 있는 경우:
-- 마지막 경기 결과와 함께 팀의 최종 순위를 자연스럽게 언급
-- 예: "~팀의 최종순위는 ~등으로 시즌을 마무리 했습니다"
-- 포스트시즌 진출 여부(상위 5등 이내)도 함께 언급
-- 한국시리즈 우승팀인 경우 "우승"이라는 표현 사용
-
-우승팀 식별 방법:
-- 한국시리즈 마지막 경기에서 승리한 팀이 우승팀
-- 경기 데이터의 'winning_team' 필드 또는 점수 비교로 우승팀 판단
-- "우승", "챔피언", "한국시리즈 우승팀" 등의 표현으로 답변
-
-절대 사용 금지:
-- "핵심:", "설명:", "요약:" 같은 구조화된 표현  
-- "제공된 DB에서", "데이터베이스 기준", "제시된 검색 결과" 같은 기술적 용어
-- 지나치게 격식적인 공문서 톤
-- **조회된 연도를 임의로 변경하거나 재계산**
-
-데이터 없는 경우:
-- "아쉽게도 해당 경기 기록을 찾을 수 없네요"
-- "죄송해요, 그 정보는 현재 확인이 어려워요"  
-- "해당 데이터가 아직 업데이트되지 않은 것 같아요"
-
-정확성 원칙:
-- 위의 조회 데이터만 사용 (추측 금지)
-- **조회된 연도(year 필드)를 절대 변경하지 마세요!**
-- 불확실하면 솔직하게 모른다고 표현
-
-자연스럽고 친근한 대화체로 답변해주세요!
-"""
+        if prompt_override:
+            # 프롬프트 오버라이드 사용
+            answer_prompt = prompt_override.format(
+                question=f"{query}{time_context}",
+                context=tool_data_text
+            )
+        elif persona == 'coach':
+            # 코치 페르소나 사용
+            answer_prompt = COACH_PROMPT.format(
+                question=f"{query}{time_context}",
+                context=tool_data_text
+            )
+        else:
+            # 기본 BEGA 페르소나 (기존 로직 유지)
+            answer_prompt = DEFAULT_ANSWER_PROMPT.format(
+                question=f"{query}{time_context}",
+                context=tool_data_text
+            )
 
         try:
             # 검증된 데이터 기반 답변 생성
+            logger.info(f"[BaseballAgent] Final Answer Prompt:\n{answer_prompt}")
             answer_messages = [{"role": "user", "content": answer_prompt}]
-            answer = await self.llm_generator(answer_messages)
+            # 스트리밍을 위해 await 제거하고 제너레이터 반환
+            answer = self.llm_generator(answer_messages)
             
             # 성공한 도구가 하나라도 있는지 확인
             has_verified_data = any(result.success for result in tool_results)

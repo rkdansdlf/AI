@@ -2,8 +2,11 @@
 
 이 모듈은 PostgreSQL 데이터베이스와 pgvector 확장을 사용하여
 벡터 임베딩 간의 코사인 유사도를 계산하고, 관련성 높은 문서를 검색하는 기능을 구현합니다.
+
+환경 변수 USE_FIRESTORE_SEARCH=true로 설정하면 Firestore Vector Search를 사용합니다.
 """
 
+import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from psycopg2.extensions import connection as PgConnection
@@ -30,8 +33,11 @@ def similarity_search(
 ) -> List[Dict[str, Any]]:
     """주어진 임베딩과 유사한 문서를 데이터베이스에서 검색합니다.
 
+    환경 변수 USE_FIRESTORE_SEARCH=true인 경우 Firestore Vector Search를 사용하고,
+    그렇지 않으면 Supabase pgvector를 사용합니다.
+
     Args:
-        conn: PostgreSQL 데이터베이스 연결 객체.
+        conn: PostgreSQL 데이터베이스 연결 객체 (Firestore 사용 시 무시됨).
         embedding: 검색의 기준이 될 벡터 임베딩.
         limit: 반환할 최대 문서 수.
         filters: 검색 결과를 필터링할 조건 (예: {'source_table': 'news'}).
@@ -40,6 +46,13 @@ def similarity_search(
     Returns:
         유사도 순으로 정렬된 문서 리스트. 각 문서는 사전(dict) 형태로 반환됩니다.
     """
+    # 환경 변수로 검색 엔진 선택
+    use_firestore = os.getenv("USE_FIRESTORE_SEARCH", "false").lower() == "true"
+
+    if use_firestore:
+        raise NotImplementedError("Firestore search has been removed.")
+
+    # 기본값: Supabase pgvector 사용 (기존 코드)
     filter_clauses: List[str] = ["embedding IS NOT NULL"]  # 임베딩이 없는 문서는 제외
     filter_params: List[Any] = []
 
@@ -91,8 +104,15 @@ def similarity_search(
     # 순서: [벡터 문자열, (키워드), ...필터 값, LIMIT 값]
     final_params = [vector_str] + keyword_param + filter_params + [limit]
 
+    import time
+    start_time = time.perf_counter()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, final_params)
         rows = cur.fetchall()
+    elapsed_ms = (time.perf_counter() - start_time) * 1000
+    
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("[Search] Vector similarity search took %.2fms (results=%d)", elapsed_ms, len(rows))
         
     return [dict(row) for row in rows]

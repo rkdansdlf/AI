@@ -18,7 +18,9 @@ import json
 import logging
 import math
 import os
+import re
 import time
+from collections import OrderedDict
 from typing import List, Optional, Sequence, Tuple
 
 import httpx
@@ -27,9 +29,70 @@ from ..config import Settings
 
 logger = logging.getLogger(__name__)
 
+_QUERY_EMBED_CACHE_MAX = int(os.getenv("EMBED_QUERY_CACHE_MAX", "2048"))
+_QUERY_EMBED_CACHE: "OrderedDict[str, List[float]]" = OrderedDict()
+_QUERY_EMBED_LOCK = asyncio.Lock()
+_QUERY_WHITESPACE_RE = re.compile(r"\s+")
+
 
 class EmbeddingError(RuntimeError):
     """임베딩 생성 과정에서 오류가 발생했을 때 사용하는 예외 클래스."""
+
+
+def _normalize_query(text: str) -> str:
+    if not text:
+        return ""
+    return _QUERY_WHITESPACE_RE.sub(" ", text).strip().casefold()
+
+
+def _embed_signature(settings: Settings) -> str:
+    provider = settings.embed_provider or "unknown"
+    env_dim = getattr(settings, "embed_dim", None) or os.getenv("EMBED_DIM")
+    embed_dim = str(env_dim) if env_dim else ""
+
+    if provider == "openai":
+        model = settings.openai_embed_model or settings.embed_model or "text-embedding-3-small"
+        return f"{provider}:{model}:{embed_dim}"
+    if provider == "openrouter":
+        model = (
+            settings.openrouter_embed_model
+            or settings.embed_model
+            or "openai/text-embedding-3-small"
+        )
+        return f"{provider}:{model}:{embed_dim}"
+    if provider == "gemini":
+        model = settings.gemini_embed_model or settings.embed_model or ""
+        return f"{provider}:{model}:{embed_dim}"
+    if provider == "hf":
+        env_model = getattr(settings, "hf_embed_model", None) or os.getenv("HF_EMBED_MODEL")
+        model = settings.embed_model or env_model or "intfloat/multilingual-e5-large"
+        return f"{provider}:{model}"
+    if provider == "local":
+        return f"{provider}:local"
+
+    model = settings.embed_model or ""
+    return f"{provider}:{model}:{embed_dim}"
+
+
+async def _get_cached_query_embedding(cache_key: str) -> Optional[List[float]]:
+    if _QUERY_EMBED_CACHE_MAX <= 0:
+        return None
+    async with _QUERY_EMBED_LOCK:
+        cached = _QUERY_EMBED_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        _QUERY_EMBED_CACHE.move_to_end(cache_key)
+        return cached
+
+
+async def _set_cached_query_embedding(cache_key: str, embedding: List[float]) -> None:
+    if _QUERY_EMBED_CACHE_MAX <= 0:
+        return
+    async with _QUERY_EMBED_LOCK:
+        _QUERY_EMBED_CACHE[cache_key] = embedding
+        _QUERY_EMBED_CACHE.move_to_end(cache_key)
+        while len(_QUERY_EMBED_CACHE) > _QUERY_EMBED_CACHE_MAX:
+            _QUERY_EMBED_CACHE.popitem(last=False)
 
 
 def _ensure_dimension(
@@ -48,12 +111,16 @@ def _ensure_dimension(
         )
 
 
-async def _embed_local(texts: Sequence[str]) -> List[List[float]]:
-    """로컬 테스트를 위해 결정론적인 사인파 기반 벡터(64차원)를 생성합니다."""
+async def _embed_local(texts: Sequence[str], settings: Settings) -> List[List[float]]:
+    """로컬 테스트를 위해 결정론적인 사인파 기반 벡터를 생성합니다."""
+    env_dim = getattr(settings, "embed_dim", None) or os.getenv("EMBED_DIM")
+    dim = int(env_dim) if env_dim else 1536
+    
     vectors: List[List[float]] = []
     for text in texts:
         seed = hash(text) % 1000
-        vector = [math.sin(idx + seed) for idx in range(64)]
+        # simple deterministic vector
+        vector = [math.sin(idx + seed) for idx in range(dim)]
         vectors.append(vector)
     return vectors
 
@@ -106,7 +173,9 @@ async def _embed_gemini(
         raise EmbeddingError("GEMINI_API_KEY가 설정되어 있지 않습니다.")
 
     # API 요청에 필요한 파라미터를 설정합니다.
-    raw_model = settings.gemini_embed_model or "text-embedding-004"
+    raw_model = settings.gemini_embed_model or settings.embed_model
+    if not raw_model:
+        raise EmbeddingError("GEMINI_EMBED_MODEL이 설정되어 있지 않습니다.")
     model_path = raw_model if raw_model.startswith("models/") else f"models/{raw_model}"
     env_dim = getattr(settings, "embed_dim", None) or os.getenv("EMBED_DIM")
     embed_dim = int(env_dim) if env_dim else 1536
@@ -434,7 +503,7 @@ async def async_embed_texts(
 
     provider = settings.embed_provider
     if provider == "local":
-        return await _embed_local(texts)
+        return await _embed_local(texts, settings)
     if provider == "hf":
         vectors = await _embed_hf(texts, settings, max_concurrency=max_concurrency)
         env_dim = getattr(settings, "embed_dim", None) or os.getenv("EMBED_DIM")
@@ -451,14 +520,61 @@ async def async_embed_texts(
     raise EmbeddingError(f"지원되지 않는 프로바이더입니다: {provider}")
 
 
+async def async_embed_query(
+    query: str,
+    settings: Settings,
+    max_concurrency: int = 1,
+) -> List[float]:
+    """단일 검색 질의를 임베딩하고, 정규화 키 기준으로 LRU 캐시를 사용합니다."""
+    if not query:
+        return []
+    normalized = _normalize_query(query)
+    cache_key = f"{_embed_signature(settings)}:{normalized}"
+
+    cached = await _get_cached_query_embedding(cache_key)
+    if cached is not None:
+        logger.debug("[Embeddings] Cache HIT for query (len=%d)", len(query))
+        return cached
+
+    start_time = time.perf_counter()
+    vectors = await async_embed_texts([query], settings, max_concurrency=max_concurrency)
+    elapsed_ms = (time.perf_counter() - start_time) * 1000
+    logger.info("[Embeddings] Query embedding took %.2fms (len=%d)", elapsed_ms, len(query))
+    
+    if not vectors:
+        return []
+
+    embedding = vectors[0]
+    await _set_cached_query_embedding(cache_key, embedding)
+    return embedding
+
+
 def embed_texts(
     texts: Sequence[str],
     settings: Settings,
     *,
     max_concurrency: int = 1,
 ) -> List[List[float]]:
-    """`async_embed_texts` 함수의 동기적 래퍼(wrapper)입니다."""
-    return asyncio.run(async_embed_texts(texts, settings, max_concurrency=max_concurrency))
+    """`async_embed_texts` 함수의 동기적 래퍼(wrapper)입니다.
+    이미 이벤트 루프가 실행 중인 경우(예: Uvicorn), 별도 스레드에서 실행하여 RuntimeError를 방지합니다.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+        
+    if loop and loop.is_running():
+        # 실행 중인 루프가 있으면 별도 스레드에서 실행
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                asyncio.run, 
+                async_embed_texts(texts, settings, max_concurrency=max_concurrency)
+            )
+            return future.result()
+    else:
+        # 실행 중인 루프가 없으면 바로 실행
+        return asyncio.run(async_embed_texts(texts, settings, max_concurrency=max_concurrency))
 
 def _estimate_tokens(text: str) -> int:
     """간단한 토큰 수 추정 (4 글자 ≈ 1 토큰)."""

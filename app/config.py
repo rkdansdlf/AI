@@ -29,8 +29,9 @@ class Settings(BaseSettings):
     debug: bool = False
     cors_origins: List[str] = Field(default_factory=lambda: ["*"])
 
-    # --- 데이터베이스 설정 (Supabase/Postgres) ---
-    supabase_db_url: str = Field(..., env="SUPABASE_DB_URL")
+    # --- 데이터베이스 설정 (OCI/Postgres) ---
+    oci_db_url: str = Field(..., env="OCI_DB_URL")
+    supabase_db_url: Optional[str] = Field(None, env="SUPABASE_DB_URL")
 
     # --- LLM / 임베딩 프로바이더 설정 ---
     # LLM(거대 언어 모델) 및 임베딩 생성을 위해 사용할 서비스를 지정합니다.
@@ -41,7 +42,7 @@ class Settings(BaseSettings):
     # --- Google Gemini 설정 ---
     gemini_api_key: Optional[str] = Field(None, env="GEMINI_API_KEY")
     gemini_model: str = Field("gemini-2.5-flash", env="GEMINI_MODEL")
-    gemini_embed_model: str = Field("text-embedding-004", env="GEMINI_EMBED_MODEL")
+    gemini_embed_model: str = Field("", env="GEMINI_EMBED_MODEL")
     gemini_base_url: str = Field(
         "https://generativelanguage.googleapis.com/v1beta/openai",
         env="GEMINI_BASE_URL",
@@ -53,7 +54,15 @@ class Settings(BaseSettings):
 
     # --- OpenRouter 설정 ---
     openrouter_api_key: Optional[str] = Field(None, env="OPENROUTER_API_KEY")
-    openrouter_model: str = Field("openai/gpt-4o-mini", env="OPENROUTER_MODEL")
+    openrouter_model: str = Field("openai/gpt-oss-120b", env="OPENROUTER_MODEL")
+    # Pydantic Settings tries to parse List[str] as JSON. read as str to avoid error.
+    openrouter_fallback_models_raw: str = Field("", env="OPENROUTER_FALLBACK_MODELS")
+    
+    @property
+    def openrouter_fallback_models(self) -> List[str]:
+        if not self.openrouter_fallback_models_raw:
+            return []
+        return [m.strip() for m in self.openrouter_fallback_models_raw.split(",") if m.strip()]
     openrouter_base_url: str = Field(
         "https://openrouter.ai/api/v1", env="OPENROUTER_BASE_URL"
     )
@@ -68,7 +77,11 @@ class Settings(BaseSettings):
     default_search_limit: int = Field(3, env="DEFAULT_SEARCH_LIMIT")
 
     # --- SSE / 채팅 관련 설정 ---
-    max_output_tokens: int = Field(1024, env="MAX_OUTPUT_TOKENS")
+    # Coach 분석 등 상세 응답에 충분한 토큰 수 필요 (기본값 4096)
+    max_output_tokens: int = Field(4096, env="MAX_OUTPUT_TOKENS")
+
+    # --- Monitoring ---
+    sentry_dsn: Optional[str] = Field(None, env="SENTRY_DSN")
 
     @field_validator("embed_provider")
     def _validate_embed_provider(cls, value: str) -> str:
@@ -96,7 +109,7 @@ class Settings(BaseSettings):
     @property
     def database_url(self) -> str:
         """데이터베이스 연결 URL을 반환합니다."""
-        return self.supabase_db_url
+        return self.oci_db_url
 
     @property
     def function_calling_model(self) -> str:

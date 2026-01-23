@@ -108,9 +108,20 @@ async def _stream_response(
             yield {"event": "error", "data": json.dumps(error_payload, ensure_ascii=False)}
         # 2. 성공 시 메시지와 메타데이터 이벤트 전송
         elif result:
-            rendered = await _render_answer(result, style)
-            # 답변의 일부(delta)를 message 이벤트로 전송
-            yield {"event": "message", "data": json.dumps({"delta": rendered}, ensure_ascii=False)}
+            answer = result.get("answer")
+            
+            # answer가 비동기 제너레이터인 경우 (스트리밍)
+            if hasattr(answer, '__aiter__'):
+                async for delta in answer:
+                    yield {"event": "message", "data": json.dumps({"delta": delta}, ensure_ascii=False)}
+                    
+                # 스트리밍 완료 후 전체 답변을 문자열로 결합하여 meta 데이터 준비 (옵션)
+                # 실제로는 meta 데이터만 보내면 됨
+            
+            # answer가 일반 문자열인 경우 (비스트리밍/일상대화)
+            else:
+                rendered = await _render_answer(result, style)
+                yield {"event": "message", "data": json.dumps({"delta": rendered}, ensure_ascii=False)}
             
             def safe_serialize(obj):
                 """JSON 직렬화 가능한 형태로 객체를 변환"""
@@ -188,15 +199,38 @@ async def chat_completion(
         question,
         context={"filters": filters, "history": history},
     )
+    
+    # ToolCall 등 커스텀 객체 직렬화 헬퍼
+    def safe_serialize(obj):
+        """JSON 직렬화 가능한 형태로 객체를 변환"""
+        from datetime import datetime, date
+        
+        if obj is None:
+            return None
+        elif isinstance(obj, (str, int, float, bool)):
+            return obj
+        elif isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        elif hasattr(obj, 'to_dict'):
+            return safe_serialize(obj.to_dict())
+        elif isinstance(obj, dict):
+            return {key: safe_serialize(value) for key, value in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [safe_serialize(item) for item in obj]
+        else:
+            if hasattr(obj, '__dict__'):
+                return {key: safe_serialize(value) for key, value in obj.__dict__.items()}
+            return str(obj)
+
     if isinstance(result, dict):
-        return JSONResponse(result)
+        return JSONResponse(safe_serialize(result))
     else:
         # result가 객체라면 dict로 변환
-        return JSONResponse({
+        return JSONResponse(safe_serialize({
             "answer": getattr(result, 'answer', str(result)),
             "citations": getattr(result, 'citations', []),
-            "intent": intent
-        })
+            "intent": getattr(result, 'intent', 'unknown')
+        }))
 
 
 @router.post("/stream")
@@ -251,7 +285,7 @@ async def chat_stream_get(
         agent=agent,
     )
 
-whisper_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY2"))
+whisper_client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY2"))
 
 @router.post("/voice")
 async def transcribe_audio(
@@ -271,8 +305,8 @@ async def transcribe_audio(
         
         logger.info("OpenAI Whisper API 호출 중...")
         
-        # 동기 호출인지 확인
-        response = whisper_client.audio.transcriptions.create(
+        # 비동기 호출로 변경
+        response = await whisper_client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
             language="ko",
