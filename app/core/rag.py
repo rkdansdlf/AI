@@ -14,7 +14,7 @@ import random
 import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from psycopg2.extensions import connection as PgConnection
+import psycopg
 import math
 
 import httpx
@@ -28,6 +28,7 @@ from .entity_extractor import enhance_search_strategy
 from .query_transformer import QueryTransformer, multi_query_retrieval
 from .context_formatter import ContextFormatter
 from ..agents.baseball_agent import BaseballStatisticsAgent
+from .wpa_calculator import WPACalculator
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ class MetaWrapper:
         row_id = self.meta.get("source_row_id")
         if row_id:
             return f"id:{row_id}"
-        
+
         # 없으면 fallback: 전체 json 덤프
         return _meta_cache_key(self.meta)
 
@@ -194,7 +195,7 @@ def _process_stat_doc_cached(
         obp = _get_safe_stat(meta, "obp")
         slg = _get_safe_stat(meta, "slg")
         avg = _get_safe_stat(meta, "avg")
-        
+
         hits = _to_int(meta.get("hits"))
         doubles = _to_int(meta.get("doubles"))
         triples = _to_int(meta.get("triples"))
@@ -322,7 +323,7 @@ class RAGPipeline:
         self,
         *,
         settings: Settings,
-        connection: PgConnection,
+        connection: psycopg.Connection,
     ) -> None:
         self.settings = settings
         self.connection = connection
@@ -330,6 +331,7 @@ class RAGPipeline:
         self.context_formatter = ContextFormatter()
         # 야구 통계 전용 에이전트 초기화
         self.baseball_agent = BaseballStatisticsAgent(connection, self._generate)
+        self.wpa_calculator = WPACalculator()
 
     async def _process_and_enrich_docs(
         self, docs: List[Dict[str, Any]], year: int
@@ -371,7 +373,7 @@ class RAGPipeline:
                     logger.info(
                         f"[RAG] Found pitcher: {meta.get('player_name')} - IP: {meta.get('innings_pitched')}, League: {league}"
                     )
-                
+
                 # [Optimized] Use MetaWrapper for efficient caching
                 meta_wrapper = MetaWrapper(meta)
                 processed, warning = _process_stat_doc_cached(

@@ -7,8 +7,9 @@
 
 from typing import Dict, List, Any, Optional, Tuple
 import logging
-from psycopg2.extensions import connection as PgConnection
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
+from psycopg import Connection as PgConnection
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +103,7 @@ class DatabaseQueryTool:
     def _load_team_mappings(self):
         """OCI DB의 teams 테이블과 franchise_id를 활용하여 팀 매핑 정보를 동적으로 로드합니다."""
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # franchise_id가 있는 팀들 조회 (최신 창단순 정렬)
             query = """
@@ -222,9 +221,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # 우선 선수가 존재하는지 확인
             check_query = """
@@ -396,9 +393,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # 타격 통계 조회
             if position in ["batting", "both"]:
@@ -506,9 +501,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # 통계 지표에 따른 쿼리 구성
             if position == "batting":
@@ -748,9 +741,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # 타격 테이블과 투구 테이블 모두에서 검색
             search_query = """
@@ -866,7 +857,7 @@ class DatabaseQueryTool:
         예상되는 수비 통계 쿼리:
         
         try:
-            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor = self.connection.cursor(row_factory=dict_row)
             
             if year:
                 query = '''
@@ -957,7 +948,7 @@ class DatabaseQueryTool:
         예상되는 구속 데이터 쿼리:
         
         try:
-            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor = self.connection.cursor(row_factory=dict_row)
             
             query = '''
                 SELECT 
@@ -1020,9 +1011,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # 모든 팀의 승무패 집계 (정규시즌 기준)
             # season_id를 통해 정확한 시즌 필터링
@@ -1234,9 +1223,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # 팀 상위 타자들 조회 (OPS 기준)
             batters_query = """
@@ -1324,9 +1311,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # 1. 먼저 player_id 조회
             player_query = """
@@ -1454,9 +1439,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             avg_query = """
                 SELECT 
@@ -1568,9 +1551,7 @@ class DatabaseQueryTool:
         }
 
         try:
-            cursor = self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
+            cursor = self.connection.cursor(row_factory=dict_row)
 
             # 1. 팀 타격 지표 및 순위
             batting_query = """
